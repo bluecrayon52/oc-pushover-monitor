@@ -7,12 +7,11 @@ Uses [Pushover](https://pushover.net) to deliver notifications with per-state pr
 ## Quick Start
 
 ```bash
-git clone <repo-url> && cd pushover_monitor
-
 # Set your Pushover credentials (get them from https://pushover.net)
 export PUSHOVER_APP_TOKEN="your_app_token"
 export PUSHOVER_USER_KEY="your_user_key"
-
+```
+```bash
 # Launch (creates a venv, installs deps, starts monitoring in background)
 ./start_monitor.sh
 ```
@@ -21,7 +20,8 @@ Or run directly without the launcher:
 
 ```bash
 pip install -r requirements.txt
-
+```
+```bash
 python3 pushover_monitor.py \
     --app-token "$PUSHOVER_APP_TOKEN" \
     --user-key "$PUSHOVER_USER_KEY"
@@ -49,6 +49,7 @@ python3 pushover_monitor.py \
 |------|---------|-------------|
 | `--idle-minutes` | 10 | Minutes before a session is considered idle |
 | `--interval` | 30 | Seconds between polling checks |
+| `--max-age-hours` | 24 | Only monitor sessions updated within this many hours |
 
 Example with custom settings:
 
@@ -59,6 +60,14 @@ python3 pushover_monitor.py \
     --idle-minutes 5 \
     --interval 60
 ```
+
+## Stopping the Monitor
+
+```bash
+pkill -f pushover_monitor.py
+```
+
+If running in the foreground, `Ctrl+C` will stop it.
 
 ## Auto-Start (Optional)
 
@@ -71,12 +80,41 @@ if ! pgrep -f "pushover_monitor.py" > /dev/null; then
 fi
 ```
 
+Verify it's running:
+
+```bash
+pgrep -fa pushover_monitor.py
+```
+
 ## How It Works
 
-1. Polls `opencode session list` every 30 seconds (prefers `--json`, falls back to text parsing)
-2. Detects state changes by matching keywords in session titles
-3. Sends a Pushover notification when a session transitions to waiting, error, or idle
-4. Tracks previous state per session to avoid duplicate notifications
+1. Detects running OpenCode processes via `ps` and resolves their working directories with `lsof`
+2. Queries the OpenCode SQLite database for the most recent session in each active directory -- one session per running instance
+3. Detects state changes by matching keywords in session titles
+4. Computes idle time from the `time_updated` epoch-millisecond column
+5. Sends a Pushover notification when a session transitions to waiting, error, or idle
+6. Tracks previous state per session to avoid duplicate notifications
+
+If process detection fails (e.g. `lsof` not available), falls back to monitoring all sessions updated within `--max-age-hours`.
+
+## Testing
+
+Run the smoke tests to verify process detection, session discovery, and state logic:
+
+```bash
+./venv/bin/python3 test_monitor.py
+```
+
+To also test Pushover delivery:
+
+```bash
+export PUSHOVER_APP_TOKEN="your_app_token"
+export PUSHOVER_USER_KEY="your_user_key"
+
+./venv/bin/python3 test_monitor.py
+```
+
+At least one `opencode` session must be running for the process detection and session discovery tests to pass.
 
 ## Troubleshooting
 

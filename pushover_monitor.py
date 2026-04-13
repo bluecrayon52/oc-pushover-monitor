@@ -8,10 +8,8 @@ when sessions are idle, waiting for user input, or encounter errors.
 import subprocess
 import json
 import time
-import os
-import re
 from datetime import datetime, timedelta
-from typing import Optional, Dict, List
+from typing import Dict, List, Set
 import requests
 from dataclasses import dataclass
 from enum import Enum
@@ -29,25 +27,25 @@ class SessionState(Enum):
 class SessionInfo:
     id: str
     title: str
-    updated: str
+    updated_ms: int  # epoch milliseconds from the DB
     state: SessionState
 
 
 class PushoverNotifier:
     """Pushover notification client"""
-    
+
     API_URL = "https://api.pushover.net/1/messages.json"
-    
+
     def __init__(self, app_token: str, user_key: str):
         self.app_token = app_token
         self.user_key = user_key
-    
+
     def send_notification(
-        self, 
-        message: str, 
+        self,
+        message: str,
         title: str = "OpenCode Alert",
         priority: int = 0,
-        sound: str = "pushover"
+        sound: str = "pushover",
     ) -> bool:
         """Send notification to Pushover"""
         try:
@@ -60,9 +58,9 @@ class PushoverNotifier:
                     "title": title,
                     "priority": priority,
                     "sound": sound,
-                    "timestamp": int(time.time())
+                    "timestamp": int(time.time()),
                 },
-                timeout=10
+                timeout=10,
             )
             return response.status_code == 200
         except Exception as e:
@@ -72,167 +70,175 @@ class PushoverNotifier:
 
 class OpenCodeSessionMonitor:
     """Monitors OpenCode sessions and sends notifications"""
-    
+
     def __init__(
-        self, 
-        pushover_app_token: str, 
+        self,
+        pushover_app_token: str,
         pushover_user_key: str,
         idle_threshold_minutes: int = 10,
-        check_interval_seconds: int = 30
+        check_interval_seconds: int = 30,
+        max_age_hours: int = 24,
     ):
         self.notifier = PushoverNotifier(pushover_app_token, pushover_user_key)
         self.idle_threshold = timedelta(minutes=idle_threshold_minutes)
         self.check_interval = check_interval_seconds
+        self.max_age_hours = max_age_hours
         self.known_sessions: Dict[str, datetime] = {}
         self.last_states: Dict[str, SessionState] = {}
-    
-    def get_sessions(self) -> List[SessionInfo]:
-        """Fetch current OpenCode sessions"""
+
+    def _get_active_directories(self) -> Set[str]:
+        """Return working directories of running ``opencode`` processes.
+
+        Uses ``ps`` to find opencode PIDs, then ``lsof -d cwd`` to resolve
+        each process's working directory.  Works on macOS and Linux.
+        """
         try:
-            # Try JSON format first
-            result = subprocess.run(
-                ["opencode", "session", "list", "--json"],
+            ps_result = subprocess.run(
+                ["ps", "-eo", "pid,command"],
                 capture_output=True,
                 text=True,
-                timeout=10
+                timeout=5,
             )
-            
-            if result.returncode == 0:
-                # Parse JSON output
-                data = json.loads(result.stdout)
-                sessions = []
-                for session_data in data:
-                    session = SessionInfo(
-                        id=session_data.get("id", "unknown"),
-                        title=session_data.get("title", "Untitled"),
-                        updated=session_data.get("updated", ""),
-                        state=self._determine_state(session_data)
-                    )
-                    sessions.append(session)
-                return sessions
-            else:
-                # JSON failed, run again without --json flag
-                result = subprocess.run(
-                    ["opencode", "session", "list"],
+            pids: List[str] = []
+            for line in ps_result.stdout.splitlines():
+                parts = line.strip().split(None, 1)
+                if len(parts) == 2 and parts[1].endswith("opencode --"):
+                    pids.append(parts[0])
+
+            dirs: Set[str] = set()
+            for pid in pids:
+                lsof = subprocess.run(
+                    ["lsof", "-a", "-p", pid, "-d", "cwd", "-Fn"],
                     capture_output=True,
                     text=True,
-                    timeout=10
+                    timeout=5,
                 )
-                if result.returncode == 0:
-                    return self._parse_text_output(result.stdout)
-                else:
-                    print(f"Error: opencode session list failed with code {result.returncode}")
-                    return []
-            
+                for line in lsof.stdout.splitlines():
+                    if line.startswith("n/"):
+                        dirs.add(line[1:])
+            return dirs
+        except Exception as e:
+            print(f"Warning: could not detect active processes: {e}")
+            return set()
+
+    def get_sessions(self) -> List[SessionInfo]:
+        """Fetch the active OpenCode session for each running instance.
+
+        Detects live ``opencode`` processes via ``ps``/``lsof``, then queries
+        the SQLite database for the most recently updated session in each
+        process's working directory.  This returns exactly one session per
+        running OpenCode instance.
+
+        Falls back to a recency-based query (``max_age_hours``) if process
+        detection finds nothing (e.g. ``lsof`` unavailable).
+        """
+        try:
+            active_dirs = self._get_active_directories()
+
+            if active_dirs:
+                # Build SQL to get the most recent session per active directory
+                placeholders = ",".join(f"'{d}'" for d in active_dirs)
+                query = (
+                    "SELECT s.id, s.title, s.time_updated, s.directory "
+                    "FROM session s "
+                    "INNER JOIN ("
+                    "  SELECT directory, MAX(time_updated) AS max_updated "
+                    "  FROM session "
+                    f"  WHERE directory IN ({placeholders}) "
+                    "  AND time_archived IS NULL "
+                    "  GROUP BY directory"
+                    ") latest "
+                    "ON s.directory = latest.directory "
+                    "AND s.time_updated = latest.max_updated "
+                    "ORDER BY s.time_updated DESC"
+                )
+            else:
+                # Fallback: no active processes detected, use recency filter
+                cutoff_ms = int((time.time() - self.max_age_hours * 3600) * 1000)
+                query = (
+                    "SELECT id, title, time_updated, directory FROM session "
+                    "WHERE time_archived IS NULL "
+                    f"AND time_updated > {cutoff_ms} "
+                    "ORDER BY time_updated DESC"
+                )
+
+            result = subprocess.run(
+                ["opencode", "db", query, "--format", "json"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+
+            if result.returncode != 0:
+                print(f"Error: opencode db query failed (rc={result.returncode})")
+                return []
+
+            data = json.loads(result.stdout)
+            sessions: List[SessionInfo] = []
+            for row in data:
+                sessions.append(
+                    SessionInfo(
+                        id=row.get("id", "unknown"),
+                        title=row.get("title", "Untitled"),
+                        updated_ms=int(row.get("time_updated", 0)),
+                        state=SessionState.UNKNOWN,
+                    )
+                )
+            return sessions
+
         except Exception as e:
             print(f"Error fetching sessions: {e}")
             return []
-    
-    def _parse_text_output(self, output: str) -> List[SessionInfo]:
-        """Parse text output from opencode session list"""
-        sessions = []
-        lines = output.strip().split("\n")
-        
-        # Skip header lines
-        for line in lines[2:]:  # Skip header and separator
-            if not line.strip() or line.startswith("-"):
-                continue
-            
-            # Fixed-width column parsing based on actual output format
-            # Format: Session ID (30 chars) | Title (78 chars) | Updated (rest)
-            if len(line) >= 32:
-                session_id = line[0:30].strip()
-                title = line[32:110].strip()  # Title column
-                updated = line[111:].strip() if len(line) > 111 else ""
-                
-                if session_id and title:
-                    sessions.append(SessionInfo(
-                        id=session_id,
-                        title=title,
-                        updated=updated,
-                        state=SessionState.UNKNOWN
-                    ))
-        
-        return sessions
-    
-    def _determine_state(self, session_data: dict) -> SessionState:
-        """Determine session state from data"""
-        # This is a heuristic - you might need to adjust based on actual opencode output
-        title = session_data.get("title", "").lower()
-        
-        if "waiting" in title or "input" in title or "question" in title:
-            return SessionState.WAITING
-        elif "error" in title or "failed" in title:
-            return SessionState.ERROR
-        elif "idle" in title:
-            return SessionState.IDLE
-        
-        return SessionState.ACTIVE
-    
+
     def _check_idle_status(self, session: SessionInfo) -> SessionState:
-        """Check session state from title keywords and idle time"""
+        """Determine session state from title keywords and idle time.
+
+        Title keyword matching is checked first (waiting / error), then
+        idle time is computed from the epoch-millisecond timestamp stored
+        in the database.
+        """
         title = session.title.lower()
-        
-        # First check for explicit state keywords in title
+
+        # Explicit state keywords in the title
         if "waiting" in title or "input" in title or "question" in title:
             return SessionState.WAITING
-        elif "error" in title or "failed" in title or "fail" in title:
+        if "error" in title or "failed" in title or "fail" in title:
             return SessionState.ERROR
-        
-        # Then check for idle time
-        try:
-            updated_str = session.updated
-            formats = ["%I:%M %p", "%H:%M", "%Y-%m-%d %H:%M:%S"]
-            
-            updated_time = None
-            for fmt in formats:
-                try:
-                    updated_time = datetime.strptime(updated_str, fmt)
-                    break
-                except ValueError:
-                    continue
-            
-            if updated_time:
-                if updated_time.year == 1900:
-                    updated_time = datetime.now().replace(
-                        hour=updated_time.hour,
-                        minute=updated_time.minute,
-                        second=updated_time.second
-                    )
-                
-                if datetime.now() - updated_time > self.idle_threshold:
-                    return SessionState.IDLE
-                    
-        except Exception:
-            pass
-        
-        # Return original state if set, otherwise ACTIVE
-        return session.state if session.state != SessionState.UNKNOWN else SessionState.ACTIVE
-    
+
+        # Idle time check using epoch millis from the DB
+        if session.updated_ms > 0:
+            age = timedelta(milliseconds=time.time() * 1000 - session.updated_ms)
+            if age > self.idle_threshold:
+                return SessionState.IDLE
+
+        return SessionState.ACTIVE
+
     def check_and_notify(self):
         """Check sessions and send notifications for state changes"""
         sessions = self.get_sessions()
         current_time = datetime.now()
-        
+
         for session in sessions:
             session_id = session.id
-            
+
             # Check for idle status
             current_state = self._check_idle_status(session)
-            
+
             # Get previous state
             previous_state = self.last_states.get(session_id)
-            
+
             # Send notification if state changed to a notable state
             if previous_state != current_state and current_state in [
-                SessionState.WAITING, SessionState.ERROR, SessionState.IDLE
+                SessionState.WAITING,
+                SessionState.ERROR,
+                SessionState.IDLE,
             ]:
                 self._send_state_notification(session, current_state)
-            
+
             # Update tracking
             self.known_sessions[session_id] = current_time
             self.last_states[session_id] = current_state
-    
+
     def _send_state_notification(self, session: SessionInfo, state: SessionState):
         """Send notification for session state"""
         if state == SessionState.WAITING:
@@ -240,52 +246,53 @@ class OpenCodeSessionMonitor:
             message = f"Session '{session.title}' is waiting for your input"
             priority = 1  # High priority
             sound = "magic"
-            
+
         elif state == SessionState.ERROR:
             title = "❌ OpenCode Error"
             message = f"Session '{session.title}' encountered an error"
             priority = 1
             sound = "siren"
-            
+
         elif state == SessionState.IDLE:
             title = "😴 OpenCode Idle"
             message = f"Session '{session.title}' has been idle for >10 minutes"
             priority = 0
             sound = "none"
-        
+
         else:
             return
-        
+
         success = self.notifier.send_notification(
-            message=message,
-            title=title,
-            priority=priority,
-            sound=sound
+            message=message, title=title, priority=priority, sound=sound
         )
-        
+
         if success:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Sent {state.value} notification for session {session.id}")
+            print(
+                f"[{datetime.now().strftime('%H:%M:%S')}] Sent {state.value} notification for session {session.id}"
+            )
         else:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Failed to send notification")
-    
+            print(
+                f"[{datetime.now().strftime('%H:%M:%S')}] Failed to send notification"
+            )
+
     def run(self):
         """Main monitoring loop"""
         print(f"🔍 OpenCode Pushover Monitor Started")
         print(f"   Checking every {self.check_interval} seconds")
         print(f"   Idle threshold: {self.idle_threshold}")
+        print(f"   Max session age: {self.max_age_hours}h")
         print(f"   Press Ctrl+C to stop\n")
-        
-        # On startup, check for any currently waiting/error sessions and notify
-        print("📋 Checking current sessions on startup...")
+
+        # Seed state from current sessions without sending notifications.
+        # This prevents a flood of alerts for sessions that were already
+        # idle/waiting/errored before the monitor started.
+        print("📋 Seeding initial session state...")
         sessions = self.get_sessions()
         for session in sessions:
             current_state = self._check_idle_status(session)
-            if current_state in [SessionState.WAITING, SessionState.ERROR]:
-                print(f"   Found {current_state.value} session: {session.title[:50]}...")
-                self._send_state_notification(session, current_state)
-                self.last_states[session.id] = current_state
-        print(f"   Found {len(sessions)} sessions\n")
-        
+            self.last_states[session.id] = current_state
+        print(f"   Tracking {len(sessions)} sessions (notifications start next poll)\n")
+
         try:
             while True:
                 self.check_and_notify()
@@ -297,42 +304,44 @@ class OpenCodeSessionMonitor:
 def main():
     """CLI entry point"""
     import argparse
-    
+
     parser = argparse.ArgumentParser(
         description="Monitor OpenCode sessions and send Pushover notifications"
     )
     parser.add_argument(
         "--app-token",
         required=True,
-        help="Pushover application token (from pushover.net/apps/build)"
+        help="Pushover application token (from pushover.net/apps/build)",
     )
     parser.add_argument(
-        "--user-key",
-        required=True,
-        help="Pushover user key (from pushover.net)"
+        "--user-key", required=True, help="Pushover user key (from pushover.net)"
     )
     parser.add_argument(
         "--idle-minutes",
         type=int,
         default=10,
-        help="Minutes before considering a session idle (default: 10)"
+        help="Minutes before considering a session idle (default: 10)",
     )
     parser.add_argument(
-        "--interval",
-        type=int,
-        default=30,
-        help="Seconds between checks (default: 30)"
+        "--interval", type=int, default=30, help="Seconds between checks (default: 30)"
     )
-    
+    parser.add_argument(
+        "--max-age-hours",
+        type=int,
+        default=24,
+        help="Only monitor sessions updated within this many hours (default: 24)",
+    )
+
     args = parser.parse_args()
-    
+
     monitor = OpenCodeSessionMonitor(
         pushover_app_token=args.app_token,
         pushover_user_key=args.user_key,
         idle_threshold_minutes=args.idle_minutes,
-        check_interval_seconds=args.interval
+        check_interval_seconds=args.interval,
+        max_age_hours=args.max_age_hours,
     )
-    
+
     monitor.run()
 
 
