@@ -11,6 +11,7 @@ export PUSHOVER_USER_KEY="${PUSHOVER_USER_KEY:-your_user_key_here}"
 # Optional configuration
 export IDLE_MINUTES="10"
 export WAIT_MINUTES="2"
+export STALL_MINUTES="10"
 export CHECK_INTERVAL="30"
 
 # Script directory
@@ -68,6 +69,7 @@ fi
     --user-key "$PUSHOVER_USER_KEY" \
     --idle-minutes "${IDLE_MINUTES:-10}" \
     --wait-minutes "${WAIT_MINUTES:-2}" \
+    --stall-minutes "${STALL_MINUTES:-10}" \
     --interval "${CHECK_INTERVAL:-30}" &
 
 MONITOR_PID=$!

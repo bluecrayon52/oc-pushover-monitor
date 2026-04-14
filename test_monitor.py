@@ -53,6 +53,8 @@ def _session(
     updated_ms=None,
     role="",
     finish="",
+    error="",
+    text="",
     pending_question=False,
 ):
     """Helper to build a SessionInfo with sensible defaults."""
@@ -63,29 +65,12 @@ def _session(
         directory="/tmp/test_project",
         last_message_role=role,
         last_message_finish=finish,
+        last_message_error=error,
+        last_message_text=text,
         has_pending_question=pending_question,
         state=SessionState.UNKNOWN,
     )
 
-
-# -- Waiting: assistant message with finish="stop" --------------------------
-check(
-    "assistant finish=stop -> waiting",
-    monitor._check_idle_status(_session(role="assistant", finish="stop"))
-    == SessionState.WAITING,
-)
-
-check(
-    "assistant finish=stop (old session) -> waiting",
-    monitor._check_idle_status(
-        _session(
-            role="assistant",
-            finish="stop",
-            updated_ms=int((time.time() - 1800) * 1000),
-        )
-    )
-    == SessionState.WAITING,
-)
 
 # -- Waiting: question tool pending -----------------------------------------
 check(
@@ -97,6 +82,142 @@ check(
     "pending question + tool-calls -> waiting",
     monitor._check_idle_status(
         _session(role="assistant", finish="tool-calls", pending_question=True)
+    )
+    == SessionState.WAITING,
+)
+
+# -- Waiting: finish=stop with prose question (? in last paragraph) ---------
+check(
+    "finish=stop + prose question -> waiting",
+    monitor._check_idle_status(
+        _session(
+            role="assistant",
+            finish="stop",
+            text="I've made the changes.\n\nDoes this look correct?",
+        )
+    )
+    == SessionState.WAITING,
+)
+
+check(
+    "finish=stop + numbered questions -> waiting",
+    monitor._check_idle_status(
+        _session(
+            role="assistant",
+            finish="stop",
+            text=(
+                "Two questions:\n\n"
+                "1. **Priority** -- should it be high?\n"
+                "2. **Threshold** -- reuse idle-minutes? 10 min seems reasonable."
+            ),
+        )
+    )
+    == SessionState.WAITING,
+)
+
+check(
+    "finish=stop (old session) + prose question -> waiting",
+    monitor._check_idle_status(
+        _session(
+            role="assistant",
+            finish="stop",
+            text="What do you think?",
+            updated_ms=int((time.time() - 1800) * 1000),
+        )
+    )
+    == SessionState.WAITING,
+)
+
+# -- Idle: finish=stop with no prose question (assistant is done) -----------
+check(
+    "finish=stop + summary text -> idle",
+    monitor._check_idle_status(
+        _session(
+            role="assistant",
+            finish="stop",
+            text="Here's a summary of all changes.\n\nUpdated README and AGENTS.md.",
+        )
+    )
+    == SessionState.IDLE,
+)
+
+check(
+    "finish=stop + empty text -> idle",
+    monitor._check_idle_status(_session(role="assistant", finish="stop", text=""))
+    == SessionState.IDLE,
+)
+
+check(
+    "finish=stop + no text -> idle",
+    monitor._check_idle_status(_session(role="assistant", finish="stop"))
+    == SessionState.IDLE,
+)
+
+# -- Prose question: code block stripping -----------------------------------
+check(
+    "finish=stop + ? only inside code block -> idle (stripped)",
+    monitor._check_idle_status(
+        _session(
+            role="assistant",
+            finish="stop",
+            text="Here's the query:\n\n```sql\nSELECT * FROM foo WHERE bar = ?\n```\n\nDone.",
+        )
+    )
+    == SessionState.IDLE,
+)
+
+check(
+    "finish=stop + ? outside code block -> waiting",
+    monitor._check_idle_status(
+        _session(
+            role="assistant",
+            finish="stop",
+            text="Here's the query:\n\n```sql\nSELECT * FROM foo WHERE bar = ?\n```\n\nShould I run it?",
+        )
+    )
+    == SessionState.WAITING,
+)
+
+# -- Error: message-level error field (DB-based detection) ------------------
+check(
+    "APIError -> error",
+    monitor._check_idle_status(_session(role="assistant", error="APIError"))
+    == SessionState.ERROR,
+)
+
+check(
+    "UnknownError -> error",
+    monitor._check_idle_status(_session(role="assistant", error="UnknownError"))
+    == SessionState.ERROR,
+)
+
+# -- Not error: user-initiated abort is excluded ----------------------------
+check(
+    "MessageAbortedError -> active (excluded)",
+    monitor._check_idle_status(_session(role="assistant", error="MessageAbortedError"))
+    == SessionState.ACTIVE,
+)
+
+# -- Not error: no error field means not an error ---------------------------
+check(
+    "no error field -> active",
+    monitor._check_idle_status(_session(role="assistant", error=""))
+    == SessionState.ACTIVE,
+)
+
+# -- Waiting takes precedence over error ------------------------------------
+check(
+    "finish=stop + APIError -> idle (finish=stop checked first)",
+    monitor._check_idle_status(
+        _session(role="assistant", finish="stop", error="APIError")
+    )
+    == SessionState.IDLE,
+)
+
+check(
+    "pending question + APIError -> waiting (question checked first)",
+    monitor._check_idle_status(
+        _session(role="assistant", error="APIError", pending_question=True)
     )
     == SessionState.WAITING,
 )
@@ -114,80 +235,131 @@ check(
     monitor._check_idle_status(_session(role="user", finish="")) == SessionState.ACTIVE,
 )
 
-# -- Error: title keyword heuristic -----------------------------------------
-error_cases = [
-    "Build failed with exit code 1",
-    "TypeError: cannot read property of undefined",
-    "Fix the failing test suite",
-]
-for title in error_cases:
-    check(
-        f"'{title[:45]}...' -> error",
-        monitor._check_idle_status(_session(title=title)) == SessionState.ERROR,
-        f"got {monitor._check_idle_status(_session(title=title)).value}",
-    )
-
-# -- Waiting takes precedence over error title -------------------------------
+# -- Active: recent session, assistant still working -------------------------
 check(
-    "finish=stop + error title -> waiting (precedence)",
+    "recent session, tool-calls -> active",
+    monitor._check_idle_status(_session(role="assistant", finish="tool-calls"))
+    == SessionState.ACTIVE,
+)
+
+# -- Stalled: session old, assistant not finished ----------------------------
+check(
+    "30-min-old tool-calls session -> stalled",
     monitor._check_idle_status(
-        _session(title="Build failed", role="assistant", finish="stop")
+        _session(
+            role="assistant",
+            finish="tool-calls",
+            updated_ms=int((time.time() - 1800) * 1000),
+        )
     )
-    == SessionState.WAITING,
+    == SessionState.STALLED,
 )
 
-# -- Active: neutral title, recent, assistant still working ------------------
-active_cases = [
-    "Implement new feature for dashboard",
-    "Refactor database connection pool",
-]
-for title in active_cases:
-    check(
-        f"'{title[:45]}...' -> active",
-        monitor._check_idle_status(_session(title=title)) == SessionState.ACTIVE,
-    )
-
-# -- Idle: session old, assistant not finished -------------------------------
 check(
-    "30-min-old neutral session -> idle",
-    monitor._check_idle_status(_session(updated_ms=int((time.time() - 1800) * 1000)))
-    == SessionState.IDLE,
+    "30-min-old in-flight session (finish=null) -> stalled",
+    monitor._check_idle_status(
+        _session(
+            role="assistant",
+            finish="",
+            updated_ms=int((time.time() - 1800) * 1000),
+        )
+    )
+    == SessionState.STALLED,
 )
 
-# -- Not idle: session recent ------------------------------------------------
+# -- Not stalled: recent session ---------------------------------------------
 check(
-    "2-min-old neutral session -> active",
-    monitor._check_idle_status(_session(updated_ms=int((time.time() - 120) * 1000)))
+    "2-min-old tool-calls session -> active",
+    monitor._check_idle_status(
+        _session(
+            role="assistant",
+            finish="tool-calls",
+            updated_ms=int((time.time() - 120) * 1000),
+        )
+    )
     == SessionState.ACTIVE,
 )
 
 # ---------------------------------------------------------------------------
-# 1b. Duration-based notification logic (offline)
+# 1b. Prose question detection (unit tests for _has_prose_question)
+# ---------------------------------------------------------------------------
+print("\n== Prose Question Detection ==")
+
+check(
+    "ends with ?",
+    OpenCodeSessionMonitor._has_prose_question("What do you think?"),
+)
+
+check(
+    "? in last paragraph (not last char)",
+    OpenCodeSessionMonitor._has_prose_question(
+        "Summary:\n\n1. Should I do this?\n2. This seems reasonable."
+    ),
+)
+
+check(
+    "no question mark -> False",
+    not OpenCodeSessionMonitor._has_prose_question("All done. Updated the file."),
+)
+
+check(
+    "? only in code block -> False",
+    not OpenCodeSessionMonitor._has_prose_question(
+        "```sql\nSELECT * WHERE x = ?\n```\n\nDone."
+    ),
+)
+
+check(
+    "? in code block AND in last paragraph -> True",
+    OpenCodeSessionMonitor._has_prose_question(
+        "```sql\nSELECT * WHERE x = ?\n```\n\nShould I run it?"
+    ),
+)
+
+check(
+    "empty string -> False",
+    not OpenCodeSessionMonitor._has_prose_question(""),
+)
+
+check(
+    "only code block with ? -> False",
+    not OpenCodeSessionMonitor._has_prose_question("```\nfoo?\n```"),
+)
+
+# ---------------------------------------------------------------------------
+# 1c. Duration-based notification logic (offline)
 # ---------------------------------------------------------------------------
 print("\n== Notification Timing ==")
 
-# Use a monitor with a short wait threshold for testing (0.01 minutes ≈ 0.6s)
+# Use a monitor with a short wait threshold for testing
 timing_monitor = OpenCodeSessionMonitor("dummy", "dummy", wait_threshold_minutes=0)
 
-# Simulate: session enters WAITING, check_and_notify should NOT notify
-# immediately on first sight (seed behaviour handled by run(), but
-# check_and_notify seeds on first encounter too).
-
-# First poll: new session in WAITING state -- seeds, no notification
-timing_monitor.tracked.clear()
-s_wait = _session(title="Test timing", role="assistant", finish="stop")
+# Build a WAITING session (finish=stop with prose question)
+s_wait = _session(
+    title="Test timing",
+    role="assistant",
+    finish="stop",
+    text="What do you think?",
+)
 s_wait_state = timing_monitor._check_idle_status(s_wait)
 check("Waiting session detected correctly", s_wait_state == SessionState.WAITING)
 
+# Build an IDLE session (finish=stop, no question)
+s_idle = _session(
+    title="Test timing",
+    role="assistant",
+    finish="stop",
+    text="All done.",
+)
+s_idle_state = timing_monitor._check_idle_status(s_idle)
+check("Idle session detected correctly", s_idle_state == SessionState.IDLE)
+
 # Manually seed the session as if check_and_notify saw it for the first time
+timing_monitor.tracked.clear()
 timing_monitor.tracked["test"] = TrackedSession(
     state=SessionState.ACTIVE,  # pretend it was ACTIVE last poll
 )
 
-# Now simulate check_and_notify seeing WAITING: it should start the timer
-# but with wait_threshold=0 it should also immediately fire.
-# We'll capture whether _send_state_notification would be called by
-# checking the tracked state after.
 notifications_sent = []
 _orig_send = timing_monitor._send_state_notification
 
@@ -198,7 +370,7 @@ def _capture_send(session, state):
 
 timing_monitor._send_state_notification = _capture_send
 
-# Mock get_sessions to return our test session
+# Mock get_sessions to return our WAITING session
 timing_monitor.get_sessions = lambda: [s_wait]
 timing_monitor.check_and_notify()
 
@@ -256,10 +428,44 @@ check(
     timing_monitor_slow.tracked["test"].waiting_since is not None,
 )
 
+# -- IDLE notification timing -----------------------------------------------
+idle_monitor = OpenCodeSessionMonitor("dummy", "dummy", idle_threshold_minutes=0)
+idle_notifications = []
+idle_monitor._send_state_notification = lambda s, st: idle_notifications.append(
+    (os.path.basename(s.directory), st)
+)
+idle_monitor.tracked["test"] = TrackedSession(state=SessionState.ACTIVE)
+idle_monitor.get_sessions = lambda: [s_idle]
+idle_monitor.check_and_notify()
+
+check(
+    "IDLE notification sent after threshold (0 min)",
+    len(idle_notifications) == 1 and idle_notifications[0][1] == SessionState.IDLE,
+    f"sent {len(idle_notifications)} notifications",
+)
+
+# With a long threshold, IDLE should be suppressed
+idle_monitor_slow = OpenCodeSessionMonitor("dummy", "dummy", idle_threshold_minutes=60)
+idle_slow_notifications = []
+idle_monitor_slow._send_state_notification = (
+    lambda s, st: idle_slow_notifications.append(st)
+)
+idle_monitor_slow.tracked["test"] = TrackedSession(state=SessionState.ACTIVE)
+idle_monitor_slow.get_sessions = lambda: [s_idle]
+idle_monitor_slow.check_and_notify()
+
+check(
+    "IDLE notification suppressed before threshold (60 min)",
+    len(idle_slow_notifications) == 0,
+    f"sent {len(idle_slow_notifications)}",
+)
+
+check(
+    "Idle timer started",
+    idle_monitor_slow.tracked["test"].idle_since is not None,
+)
+
 # -- WAITING -> WAITING with activity (the "stuck on WAITING" bug fix) ------
-# Simulate: monitor already notified for a WAITING session, then the session
-# has activity (updated_ms changes) but state stays WAITING (poll missed the
-# brief ACTIVE window).  The timer should reset and re-notify after threshold.
 activity_monitor = OpenCodeSessionMonitor("dummy", "dummy", wait_threshold_minutes=0)
 activity_notifications = []
 activity_monitor._send_state_notification = lambda s, st: activity_notifications.append(
@@ -267,7 +473,7 @@ activity_monitor._send_state_notification = lambda s, st: activity_notifications
 )
 
 # Seed as WAITING with updated_ms=1000
-s_wait_v1 = _session(role="assistant", finish="stop")
+s_wait_v1 = _session(role="assistant", finish="stop", text="What do you think?")
 s_wait_v1.updated_ms = 1000
 activity_monitor.tracked["test"] = TrackedSession(
     state=SessionState.WAITING,
@@ -286,7 +492,7 @@ check(
 )
 
 # Poll with changed updated_ms -- activity detected, should re-notify
-s_wait_v2 = _session(role="assistant", finish="stop")
+s_wait_v2 = _session(role="assistant", finish="stop", text="What do you think?")
 s_wait_v2.updated_ms = 2000  # changed!
 activity_notifications.clear()
 activity_monitor.get_sessions = lambda: [s_wait_v2]

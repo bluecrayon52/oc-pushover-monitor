@@ -1,6 +1,6 @@
 # OpenCode Pushover Monitor
 
-Get push notifications on your phone when [OpenCode](https://opencode.ai) sessions need your attention -- waiting for input, errored, or idle.
+Get push notifications on your phone when [OpenCode](https://opencode.ai) sessions need your attention -- waiting for input, errored, idle, or stalled.
 
 Uses [Pushover](https://pushover.net) to deliver notifications with per-state priority and sound.
 
@@ -39,15 +39,18 @@ python3 pushover_monitor.py \
 
 | State | Priority | Sound | Trigger |
 |-------|----------|-------|---------|
-| Waiting for input | High | magic | Title contains "waiting", "input", or "question" |
-| Error | High | siren | Title contains "error", "failed", or "fail" |
-| Idle | Normal | none | Session inactive for >10 minutes |
+| Waiting for input | High | magic | A `question` tool call is pending, or `finish = "stop"` and the last paragraph contains a `?` (prose question) |
+| Error | High | siren | Latest assistant message has a non-abort error (e.g. `APIError`, `UnknownError`) |
+| Stalled | High | siren | Assistant was working (`finish = "tool-calls"` or in-flight) but `time_updated` hasn't advanced for `--stall-minutes` |
+| Idle | Normal | none | `finish = "stop"` and the last paragraph has no `?` (assistant completed its turn without asking anything) |
 
 ## Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--idle-minutes` | 10 | Minutes before a session is considered idle |
+| `--idle-minutes` | 10 | Minutes before notifying that a completed session is idle |
+| `--wait-minutes` | 2 | Minutes a session must be waiting before sending a notification |
+| `--stall-minutes` | 10 | Minutes of no progress before considering a session stalled |
 | `--interval` | 30 | Seconds between polling checks |
 | `--max-age-hours` | 24 | Only monitor sessions updated within this many hours |
 
@@ -71,12 +74,15 @@ If running in the foreground, `Ctrl+C` will stop it.
 
 ## Auto-Start (Optional)
 
-Add to your `~/.zshrc` or `~/.bashrc`:
+Add to your `~/.zshrc` or `~/.bashrc` (the `export` lines must appear before the monitor block):
 
 ```bash
+export PUSHOVER_APP_TOKEN="your_app_token"
+export PUSHOVER_USER_KEY="your_user_key"
+
 # Start OpenCode Pushover Monitor if not running
 if ! pgrep -f "pushover_monitor.py" > /dev/null; then
-    /path/to/pushover_monitor/start_monitor.sh > /dev/null 2>&1
+    /path/to/oc-pushover-monitor/start_monitor.sh > /dev/null 2>&1
 fi
 ```
 
@@ -90,10 +96,9 @@ pgrep -fa pushover_monitor.py
 
 1. Detects running OpenCode processes via `ps` and resolves their working directories with `lsof`
 2. Queries the OpenCode SQLite database for the most recent session in each active directory -- one session per running instance
-3. Detects state changes by matching keywords in session titles
-4. Computes idle time from the `time_updated` epoch-millisecond column
-5. Sends a Pushover notification when a session transitions to waiting, error, or idle
-6. Tracks previous state per session to avoid duplicate notifications
+3. Determines session state from DB signals: `finish` and `error` fields on the latest message, pending `question` tool calls in the `part` table, prose question detection (last paragraph contains `?`), and `time_updated` staleness for stall detection
+4. Sends a Pushover notification when a session has been in a notifiable state long enough (e.g. waiting for `--wait-minutes`, idle for `--idle-minutes`)
+5. Tracks per-session state and duration to avoid duplicate notifications and support re-notification after activity
 
 If process detection fails (e.g. `lsof` not available), falls back to monitoring all sessions updated within `--max-age-hours`.
 
