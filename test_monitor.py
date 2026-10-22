@@ -2,11 +2,10 @@
 """
 Smoke tests for pushover_monitor.
 
-Offline tests (no tokens required):
     ./venv/bin/python3 test_monitor.py
 
-Full tests including Pushover delivery:
-    PUSHOVER_APP_TOKEN="..." PUSHOVER_USER_KEY="..." ./venv/bin/python3 test_monitor.py
+Offline tests always run.  Live discovery tests need a running opencode
+client.  Pushover delivery runs when credentials resolve (env or Keychain).
 """
 
 import os
@@ -19,6 +18,7 @@ from pushover_monitor import (
     SessionInfo,
     SessionState,
     TrackedSession,
+    resolve_credential,
 )
 
 PASS = 0
@@ -180,21 +180,21 @@ check(
 
 # -- Error: message-level error field (DB-based detection) ------------------
 check(
-    "APIError -> error",
-    monitor._check_idle_status(_session(role="assistant", error="APIError"))
+    "provider.error -> error",
+    monitor._check_idle_status(_session(role="assistant", error="provider.error"))
     == SessionState.ERROR,
 )
 
 check(
-    "UnknownError -> error",
-    monitor._check_idle_status(_session(role="assistant", error="UnknownError"))
+    "unknown -> error",
+    monitor._check_idle_status(_session(role="assistant", error="unknown"))
     == SessionState.ERROR,
 )
 
 # -- Not error: user-initiated abort is excluded ----------------------------
 check(
-    "MessageAbortedError -> active (excluded)",
-    monitor._check_idle_status(_session(role="assistant", error="MessageAbortedError"))
+    "aborted -> active (excluded)",
+    monitor._check_idle_status(_session(role="assistant", error="aborted"))
     == SessionState.ACTIVE,
 )
 
@@ -207,17 +207,17 @@ check(
 
 # -- Waiting takes precedence over error ------------------------------------
 check(
-    "finish=stop + APIError -> idle (finish=stop checked first)",
+    "finish=stop + provider.error -> idle (finish=stop checked first)",
     monitor._check_idle_status(
-        _session(role="assistant", finish="stop", error="APIError")
+        _session(role="assistant", finish="stop", error="provider.error")
     )
     == SessionState.IDLE,
 )
 
 check(
-    "pending question + APIError -> waiting (question checked first)",
+    "pending question + provider.error -> waiting (question checked first)",
     monitor._check_idle_status(
-        _session(role="assistant", error="APIError", pending_question=True)
+        _session(role="assistant", error="provider.error", pending_question=True)
     )
     == SessionState.WAITING,
 )
@@ -508,6 +508,153 @@ check(
 timing_monitor._send_state_notification = _orig_send
 
 # ---------------------------------------------------------------------------
+# 1d. OpenCode v2 API mapping (offline)
+# ---------------------------------------------------------------------------
+print("\n== V2 API Mapping ==")
+
+_api_session = {
+    "id": "ses_test",
+    "title": "Mapped",
+    "time": {"created": now_ms - 5000, "updated": now_ms},
+    "location": {"directory": "/tmp/mapped_project"},
+}
+
+
+def _map(latest, pending=False):
+    info = OpenCodeSessionMonitor._session_from_api(_api_session, latest, pending)
+    return info, monitor._check_idle_status(info)
+
+
+info, st = _map({"type": "idle", "outcome": "succeeded"})
+check(
+    "idle/succeeded -> finish=stop, IDLE",
+    info.last_message_finish == "stop" and st == SessionState.IDLE,
+)
+check(
+    "session fields mapped",
+    info.directory == "/tmp/mapped_project" and info.updated_ms == now_ms,
+)
+
+info, st = _map(
+    {
+        "type": "idle",
+        "outcome": "failed",
+        "error": {"type": "output-limit", "message": "x"},
+    }
+)
+check("idle/failed output-limit -> ERROR", st == SessionState.ERROR)
+
+info, st = _map(
+    {
+        "type": "assistant",
+        "finish": "tool-calls",
+        "error": {"type": "provider.error", "message": "x"},
+        "content": [],
+    }
+)
+check("assistant provider.error -> ERROR", st == SessionState.ERROR)
+
+old_session = dict(_api_session, time={"created": 0, "updated": now_ms - 3_600_000})
+info = OpenCodeSessionMonitor._session_from_api(
+    old_session, {"type": "idle", "outcome": "interrupted"}, False
+)
+check(
+    "old idle/interrupted -> ACTIVE (not stalled)",
+    monitor._check_idle_status(info) == SessionState.ACTIVE,
+)
+
+info = OpenCodeSessionMonitor._session_from_api(
+    old_session, {"type": "assistant", "content": []}, False
+)
+check(
+    "old in-flight assistant -> STALLED",
+    monitor._check_idle_status(info) == SessionState.STALLED,
+)
+
+info, st = _map(
+    {
+        "type": "assistant",
+        "content": [
+            {"type": "tool", "name": "question", "state": {"status": "running"}}
+        ],
+    }
+)
+check("running question tool -> WAITING", st == SessionState.WAITING)
+
+info, st = _map(
+    {
+        "type": "assistant",
+        "content": [
+            {"type": "tool", "name": "question", "state": {"status": "completed"}}
+        ],
+    }
+)
+check("completed question tool -> ACTIVE", st == SessionState.ACTIVE)
+
+info, st = _map(
+    {"type": "assistant", "finish": "tool-calls", "content": []}, pending=True
+)
+check("pending form/permission -> WAITING", st == SessionState.WAITING)
+
+info, st = _map({"type": "user", "text": "hi"})
+check(
+    "user message -> ACTIVE",
+    info.last_message_role == "user" and st == SessionState.ACTIVE,
+)
+
+# -- Process filtering -------------------------------------------------------
+_client = OpenCodeSessionMonitor._is_opencode_client
+check("'opencode --' is a client", _client("/Users/x/.opencode/bin/opencode --"))
+check("bare 'opencode' is a client", _client("opencode"))
+check("'opencode /path' is a client", _client("opencode /tmp/proj"))
+check(
+    "'opencode serve --service' is not a client",
+    not _client("/x/opencode serve --service"),
+)
+check(
+    "'opencode api get ...' is not a client", not _client("opencode api get /api/info")
+)
+check("'opencode-auth run --' is not a client", not _client("opencode-auth run --"))
+
+# ---------------------------------------------------------------------------
+# 1e. Credential resolution (offline)
+# ---------------------------------------------------------------------------
+print("\n== Credential Resolution ==")
+
+import pushover_monitor as _pm  # noqa: E402
+
+_orig_keychain = _pm.read_keychain_secret
+_orig_env = os.environ.get("OC_PM_TEST_SECRET")
+try:
+    _pm.read_keychain_secret = lambda account, service=_pm.KEYCHAIN_SERVICE: (
+        "from-keychain" if account == "acct" else ""
+    )
+    os.environ.pop("OC_PM_TEST_SECRET", None)
+    check(
+        "Keychain used when no flag/env",
+        resolve_credential(None, "OC_PM_TEST_SECRET", "acct")
+        == ("from-keychain", "Keychain"),
+    )
+    os.environ["OC_PM_TEST_SECRET"] = "from-env"
+    check(
+        "env overrides Keychain",
+        resolve_credential(None, "OC_PM_TEST_SECRET", "acct")[0] == "from-env",
+    )
+    check(
+        "flag overrides env",
+        resolve_credential("from-flag", "OC_PM_TEST_SECRET", "acct")[0] == "from-flag",
+    )
+    os.environ.pop("OC_PM_TEST_SECRET", None)
+    check(
+        "missing everywhere -> empty",
+        resolve_credential(None, "OC_PM_TEST_SECRET", "other") == ("", ""),
+    )
+finally:
+    _pm.read_keychain_secret = _orig_keychain
+    if _orig_env is not None:
+        os.environ["OC_PM_TEST_SECRET"] = _orig_env
+
+# ---------------------------------------------------------------------------
 # 2. Process detection (requires opencode to be running)
 # ---------------------------------------------------------------------------
 print("\n== Process Detection ==")
@@ -558,8 +705,8 @@ for s in sessions:
 # ---------------------------------------------------------------------------
 print("\n== Pushover Delivery ==")
 
-app_token = os.environ.get("PUSHOVER_APP_TOKEN", "")
-user_key = os.environ.get("PUSHOVER_USER_KEY", "")
+app_token, _ = resolve_credential(None, "PUSHOVER_APP_TOKEN", "app-token")
+user_key, _ = resolve_credential(None, "PUSHOVER_USER_KEY", "user-key")
 
 if app_token and user_key:
     notifier = PushoverNotifier(app_token, user_key)
@@ -574,7 +721,7 @@ if app_token and user_key:
         print("         Check your phone for the test notification.")
 else:
     print(
-        "  SKIP  Pushover tokens not set -- set PUSHOVER_APP_TOKEN and PUSHOVER_USER_KEY to test delivery"
+        "  SKIP  Pushover credentials not found (env or Keychain) -- run ./start_monitor.sh --setup-keychain to test delivery"
     )
 
 # ---------------------------------------------------------------------------

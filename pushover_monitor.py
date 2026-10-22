@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 OpenCode Pushover Notifier
-Monitors OpenCode sessions and sends iPhone notifications via Pushover
+Monitors OpenCode (v2) sessions and sends iPhone notifications via Pushover
 when sessions are idle, waiting for user input, or encounter errors.
 """
 
@@ -9,12 +9,58 @@ import os
 import re
 import subprocess
 import json
+import sys
 import time
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
+from urllib.parse import quote
 import requests
 from dataclasses import dataclass
 from enum import Enum
+
+# macOS Keychain service name used to store Pushover credentials.
+KEYCHAIN_SERVICE = "oc-pushover-monitor"
+KEYCHAIN_ACCOUNT_APP_TOKEN = "app-token"
+KEYCHAIN_ACCOUNT_USER_KEY = "user-key"
+
+
+def read_keychain_secret(account: str, service: str = KEYCHAIN_SERVICE) -> str:
+    """Return a generic password from the macOS login Keychain, or "".
+
+    Uses the ``security`` CLI so no third-party dependency is needed.  The
+    secret is read from stdout and never appears in any process's argv.
+    """
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def resolve_credential(
+    cli_value: Optional[str], env_var: str, keychain_account: str
+) -> Tuple[str, str]:
+    """Resolve a credential: CLI flag > environment variable > macOS Keychain.
+
+    Returns ``(value, source)`` where ``source`` describes where the value
+    came from (``""`` when not found).
+    """
+    if cli_value:
+        return cli_value, "command line"
+    env_value = os.environ.get(env_var, "")
+    if env_value:
+        return env_value, f"${env_var}"
+    keychain_value = read_keychain_secret(keychain_account)
+    if keychain_value:
+        return keychain_value, "Keychain"
+    return "", ""
 
 
 class SessionState(Enum):
@@ -30,18 +76,27 @@ class SessionState(Enum):
 class SessionInfo:
     id: str
     title: str
-    updated_ms: int  # epoch milliseconds from the DB
+    updated_ms: int  # epoch milliseconds (session time.updated)
     directory: str  # absolute path of the session's working directory
     last_message_role: str  # "assistant", "user", or "" if unknown
     last_message_finish: str  # "stop", "tool-calls", or "" if unknown/null
-    last_message_error: str  # error name e.g. "APIError", "UnknownError", or ""
+    last_message_error: str  # v2 error type e.g. "provider.error", or ""
     last_message_text: str  # text of last text part in the latest message
-    has_pending_question: bool  # True if a question tool is waiting for user input
+    has_pending_question: bool  # True if a question/form/permission awaits input
     state: SessionState
+    is_idle: bool = False  # True once OpenCode has recorded the turn as ended
 
-    # Error names that indicate a real failure worth notifying about.
-    # MessageAbortedError is excluded because it's user-initiated (cancel).
-    NOTIFIABLE_ERRORS = frozenset({"APIError", "UnknownError"})
+    # OpenCode v2 error types that indicate a real failure worth notifying
+    # about.  "aborted" is excluded because it's user-initiated (cancel).
+    NOTIFIABLE_ERRORS = frozenset(
+        {"provider.error", "provider.content-filter", "unknown", "output-limit"}
+    )
+
+    # Message types that describe the conversation turn.  Bookkeeping
+    # messages (system, agent/model/location switches) are ignored.
+    TURN_MESSAGE_TYPES = frozenset(
+        {"user", "assistant", "idle", "shell", "synthetic", "skill", "compaction"}
+    )
 
 
 @dataclass
@@ -116,11 +171,36 @@ class OpenCodeSessionMonitor:
         self.max_age_hours = max_age_hours
         self.tracked: Dict[str, TrackedSession] = {}
 
-    def _get_active_directories(self) -> Set[str]:
-        """Return working directories of running ``opencode`` processes.
+    # Recent top-level sessions to fetch per poll.  The v2 API returns
+    # sessions across all projects, newest first.
+    session_limit = 50
+    # Messages to scan from the end when looking for the latest turn
+    # message (skips trailing system/agent-switch bookkeeping messages).
+    MESSAGE_PAGE_SIZE = 5
+    # ``opencode`` subcommands that are not interactive clients.
+    NON_CLIENT_SUBCOMMANDS = frozenset(
+        {
+            "serve", "service", "api", "acp", "debug", "auth", "mcp", "plugin",
+            "models", "stats", "run", "session", "reload", "pair", "upgrade",
+            "update", "uninstall",
+        }
+    )  # fmt: skip
 
-        Uses ``ps`` to find opencode PIDs, then ``lsof -d cwd`` to resolve
-        each process's working directory.  Works on macOS and Linux.
+    @classmethod
+    def _is_opencode_client(cls, command: str) -> bool:
+        """True if a ``ps`` command line is an interactive opencode client."""
+        argv = command.split()
+        if not argv or os.path.basename(argv[0]) != "opencode":
+            return False
+        return len(argv) == 1 or argv[1] not in cls.NON_CLIENT_SUBCOMMANDS
+
+    def _get_active_directories(self) -> Set[str]:
+        """Return working directories of running ``opencode`` client processes.
+
+        Uses ``ps`` to find opencode client PIDs (excluding the background
+        server and one-shot subcommands such as ``opencode api``), then
+        ``lsof -d cwd`` to resolve each process's working directory.  Works
+        on macOS and Linux.
         """
         try:
             ps_result = subprocess.run(
@@ -132,7 +212,7 @@ class OpenCodeSessionMonitor:
             pids: List[str] = []
             for line in ps_result.stdout.splitlines():
                 parts = line.strip().split(None, 1)
-                if len(parts) == 2 and parts[1].endswith("opencode --"):
+                if len(parts) == 2 and self._is_opencode_client(parts[1]):
                     pids.append(parts[0])
 
             dirs: Set[str] = set()
@@ -151,158 +231,191 @@ class OpenCodeSessionMonitor:
             print(f"Warning: could not detect active processes: {e}")
             return set()
 
-    def _run_db_query(self, query: str) -> List[dict]:
-        """Execute a SQL query via the ``opencode db`` CLI and return parsed rows."""
-        result = subprocess.run(
-            ["opencode", "db", query, "--format", "json"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode != 0:
-            print(f"Error: opencode db query failed (rc={result.returncode})")
-            return []
-        return json.loads(result.stdout)
+    def _api_get(self, path: str) -> Optional[dict]:
+        """GET a path from the OpenCode v2 server via ``opencode api``.
 
-    def get_sessions(self) -> List[SessionInfo]:
-        """Fetch the active OpenCode session for each running instance.
-
-        Detects live ``opencode`` processes via ``ps``/``lsof``, then queries
-        the SQLite database for the most recently updated session in each
-        process's working directory.  This returns exactly one session per
-        running OpenCode instance.
-
-        For each session, also fetches the latest message to determine
-        whether the assistant has finished (``finish = 'stop'``) and is
-        waiting for user input.
-
-        Falls back to a recency-based query (``max_age_hours``) if process
-        detection finds nothing (e.g. ``lsof`` unavailable).
+        ``opencode api`` handles service discovery and authentication, so
+        the monitor never needs the server URL or credentials.  Query
+        parameters must be embedded in ``path`` (``--param`` only applies
+        to OpenAPI path parameters).  Returns ``None`` on any failure.
         """
         try:
-            active_dirs = self._get_active_directories()
+            result = subprocess.run(
+                ["opencode", "api", "get", path],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            print(f"Error: opencode api request failed: {e}")
+            return None
+        if result.returncode != 0:
+            print(f"Error: opencode api get {path} failed (rc={result.returncode})")
+            return None
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError:
+            print(f"Error: opencode api get {path} returned invalid JSON")
+            return None
 
-            if active_dirs:
-                # Build SQL to get the most recent session per active directory
-                placeholders = ",".join(f"'{d}'" for d in active_dirs)
-                session_query = (
-                    "SELECT s.id, s.title, s.time_updated, s.directory "
-                    "FROM session s "
-                    "INNER JOIN ("
-                    "  SELECT directory, MAX(time_updated) AS max_updated "
-                    "  FROM session "
-                    f"  WHERE directory IN ({placeholders}) "
-                    "  AND time_archived IS NULL "
-                    "  GROUP BY directory"
-                    ") latest "
-                    "ON s.directory = latest.directory "
-                    "AND s.time_updated = latest.max_updated "
-                    "ORDER BY s.time_updated DESC"
-                )
-            else:
-                # Fallback: no active processes detected, use recency filter
-                cutoff_ms = int((time.time() - self.max_age_hours * 3600) * 1000)
-                session_query = (
-                    "SELECT id, title, time_updated, directory FROM session "
-                    "WHERE time_archived IS NULL "
-                    f"AND time_updated > {cutoff_ms} "
-                    "ORDER BY time_updated DESC"
-                )
+    def _list_root_sessions(self) -> List[dict]:
+        """Return recent top-level sessions (subagent sessions excluded)."""
+        resp = self._api_get(f"/api/session?parentID=null&limit={self.session_limit}")
+        return (resp or {}).get("data", [])
 
-            session_rows = self._run_db_query(session_query)
-            if not session_rows:
+    def _pending_input_session_ids(self, directories: Set[str]) -> Set[str]:
+        """Session IDs with a pending form or permission request.
+
+        Both endpoints are location-scoped, so query each directory.
+        """
+        ids: Set[str] = set()
+        for directory in directories:
+            loc = quote(directory, safe="")
+            for path in ("/api/form", "/api/permission/request"):
+                resp = self._api_get(f"{path}?location[directory]={loc}")
+                for item in (resp or {}).get("data", []):
+                    if item.get("sessionID"):
+                        ids.add(item["sessionID"])
+        return ids
+
+    def _latest_turn_message(self, session_id: str) -> dict:
+        """Return the newest message that describes the conversation turn."""
+        resp = self._api_get(
+            f"/api/session/{session_id}/message?limit={self.MESSAGE_PAGE_SIZE}&order=desc"
+        )
+        for msg in (resp or {}).get("data", []):
+            if msg.get("type") in SessionInfo.TURN_MESSAGE_TYPES:
+                return msg
+        return {}
+
+    @staticmethod
+    def _session_from_api(
+        session: dict, latest: dict, pending_input: bool
+    ) -> SessionInfo:
+        """Map a v2 ``Session.Info`` and its latest message onto ``SessionInfo``.
+
+        An ``idle`` message marks the end of a turn; its outcome/error
+        override the preceding assistant message's ``finish``.
+        """
+        msg_type = latest.get("type", "")
+        finish = ""
+        error = ""
+        text = ""
+        role = ""
+        is_idle = False
+
+        if msg_type == "idle":
+            is_idle = True
+            role = "assistant"
+            outcome = latest.get("outcome", "")
+            error = (latest.get("error") or {}).get("type", "")
+            if outcome == "succeeded":
+                finish = "stop"
+        elif msg_type == "assistant":
+            role = "assistant"
+            finish = latest.get("finish") or ""
+            error = (latest.get("error") or {}).get("type", "")
+            content = latest.get("content") or []
+            for part in content:
+                if (
+                    part.get("type") == "tool"
+                    and part.get("name") == "question"
+                    and (part.get("state") or {}).get("status")
+                    in ("streaming", "running")
+                ):
+                    pending_input = True
+        elif msg_type:
+            role = "user"
+
+        return SessionInfo(
+            id=session.get("id", "unknown"),
+            title=session.get("title", "Untitled"),
+            updated_ms=int((session.get("time") or {}).get("updated", 0)),
+            directory=(session.get("location") or {}).get("directory", ""),
+            last_message_role=role,
+            last_message_finish=finish,
+            last_message_error=error,
+            last_message_text=text,
+            has_pending_question=pending_input,
+            state=SessionState.UNKNOWN,
+            is_idle=is_idle,
+        )
+
+    def get_sessions(self) -> List[SessionInfo]:
+        """Fetch the current session for each running OpenCode instance.
+
+        Lists recent top-level sessions from the OpenCode v2 server, then
+        keeps the most recently updated one per working directory of a live
+        ``opencode`` client process.  Falls back to every session updated
+        within ``max_age_hours`` if process detection finds nothing.
+
+        For each kept session, fetches the latest turn message plus any
+        pending forms/permission requests to classify its state.
+        """
+        try:
+            all_sessions = self._list_root_sessions()
+            if not all_sessions:
                 return []
 
-            # For each session, fetch the latest message's role and finish
-            # status to determine if the assistant is waiting for user input.
-            session_ids = [row.get("id", "") for row in session_rows]
-            id_list = ",".join(f"'{sid}'" for sid in session_ids)
-            msg_query = (
-                "SELECT m.id AS message_id, m.session_id, "
-                "  json_extract(m.data, '$.role') AS role, "
-                "  json_extract(m.data, '$.finish') AS finish, "
-                "  json_extract(m.data, '$.error.name') AS error_name "
-                "FROM message m "
-                "INNER JOIN ("
-                "  SELECT session_id, MAX(time_created) AS max_created "
-                "  FROM message "
-                f"  WHERE session_id IN ({id_list}) "
-                "  GROUP BY session_id"
-                ") latest "
-                "ON m.session_id = latest.session_id "
-                "AND m.time_created = latest.max_created"
-            )
-            msg_rows = self._run_db_query(msg_query)
-            msg_by_session: Dict[str, dict] = {r["session_id"]: r for r in msg_rows}
+            active_dirs = self._get_active_directories()
+            selected: List[dict] = []
+            if active_dirs:
+                latest_by_dir: Dict[str, dict] = {}
+                for s in all_sessions:
+                    if (s.get("time") or {}).get("archived"):
+                        continue
+                    d = (s.get("location") or {}).get("directory", "")
+                    if d not in active_dirs:
+                        continue
+                    cur = latest_by_dir.get(d)
+                    if cur is None or s["time"]["updated"] > cur["time"]["updated"]:
+                        latest_by_dir[d] = s
+                selected = list(latest_by_dir.values())
+            else:
+                cutoff_ms = int((time.time() - self.max_age_hours * 3600) * 1000)
+                selected = [
+                    s
+                    for s in all_sessions
+                    if not (s.get("time") or {}).get("archived")
+                    and (s.get("time") or {}).get("updated", 0) > cutoff_ms
+                ]
 
-            # Check for pending question tool calls (the question tool
-            # blocks on user input but doesn't set finish="stop").
-            question_query = (
-                "SELECT DISTINCT p.session_id "
-                "FROM part p "
-                f"WHERE p.session_id IN ({id_list}) "
-                "AND json_extract(p.data, '$.tool') = 'question' "
-                "AND json_extract(p.data, '$.state.status') "
-                "    IN ('pending', 'running')"
-            )
-            question_rows = self._run_db_query(question_query)
-            sessions_with_question = {r["session_id"] for r in question_rows}
-
-            # For sessions where the assistant finished (finish="stop"),
-            # fetch the last text part to detect prose questions.  We get
-            # the message IDs of finish="stop" messages first, then query
-            # for their last text part.
-            stop_msg_ids = [
-                msg_by_session[sid]["message_id"]
-                for sid in session_ids
-                if sid in msg_by_session and msg_by_session[sid].get("finish") == "stop"
-            ]
-            text_by_message: Dict[str, str] = {}
-            if stop_msg_ids:
-                mid_list = ",".join(f"'{mid}'" for mid in stop_msg_ids)
-                text_query = (
-                    "SELECT p.message_id, json_extract(p.data, '$.text') AS text "
-                    "FROM part p "
-                    "INNER JOIN ("
-                    "  SELECT message_id, MAX(time_created) AS max_created "
-                    "  FROM part "
-                    f"  WHERE message_id IN ({mid_list}) "
-                    "  AND json_extract(data, '$.type') = 'text' "
-                    "  GROUP BY message_id"
-                    ") latest "
-                    "ON p.message_id = latest.message_id "
-                    "AND p.time_created = latest.max_created "
-                    "AND json_extract(p.data, '$.type') = 'text'"
-                )
-                text_rows = self._run_db_query(text_query)
-                text_by_message = {
-                    r["message_id"]: r.get("text") or "" for r in text_rows
-                }
+            selected.sort(key=lambda s: s["time"]["updated"], reverse=True)
+            dirs = {(s.get("location") or {}).get("directory", "") for s in selected}
+            pending_ids = self._pending_input_session_ids({d for d in dirs if d})
 
             sessions: List[SessionInfo] = []
-            for row in session_rows:
-                sid = row.get("id", "unknown")
-                msg = msg_by_session.get(sid, {})
-                msg_id = msg.get("message_id", "")
-                sessions.append(
-                    SessionInfo(
-                        id=sid,
-                        title=row.get("title", "Untitled"),
-                        updated_ms=int(row.get("time_updated", 0)),
-                        directory=row.get("directory", ""),
-                        last_message_role=msg.get("role") or "",
-                        last_message_finish=msg.get("finish") or "",
-                        last_message_error=msg.get("error_name") or "",
-                        last_message_text=text_by_message.get(msg_id, ""),
-                        has_pending_question=sid in sessions_with_question,
-                        state=SessionState.UNKNOWN,
-                    )
-                )
+            for s in selected:
+                latest = self._latest_turn_message(s["id"])
+                info = self._session_from_api(s, latest, s["id"] in pending_ids)
+                if latest.get("type") in ("assistant", "idle"):
+                    info.last_message_text = self._last_assistant_text(s["id"], latest)
+                sessions.append(info)
             return sessions
 
         except Exception as e:
             print(f"Error fetching sessions: {e}")
             return []
+
+    def _last_assistant_text(self, session_id: str, latest: dict) -> str:
+        """Return the last text block of the most recent assistant message.
+
+        When the latest message is an ``idle`` marker, look back for the
+        assistant message that precedes it.
+        """
+        msg = latest
+        if latest.get("type") != "assistant":
+            resp = self._api_get(
+                f"/api/session/{session_id}/message?limit=1&order=desc&type=assistant"
+            )
+            data = (resp or {}).get("data", [])
+            msg = data[0] if data else {}
+        texts = [
+            p.get("text", "")
+            for p in (msg.get("content") or [])
+            if p.get("type") == "text"
+        ]
+        return texts[-1] if texts else ""
 
     @staticmethod
     def _has_prose_question(text: str) -> bool:
@@ -330,9 +443,9 @@ class OpenCodeSessionMonitor:
         1. **Waiting** -- a ``question`` tool call is pending/running, OR
            the assistant finished (``finish = 'stop'``) and the last
            paragraph of its text contains a ``?`` (prose question).
-        2. **Error** -- the latest assistant message has a notifiable
-           error name (``APIError``, ``UnknownError``).  User-initiated
-           aborts (``MessageAbortedError``) are excluded.
+        2. **Error** -- the latest assistant/idle message has a notifiable
+           v2 error type (``provider.error``, ``unknown``, ...).
+           User-initiated aborts (``aborted``) are excluded.
         3. **Idle** -- ``finish = 'stop'`` with no prose question: the
            assistant completed its turn without asking anything.
         4. **Stalled** -- ``finish`` is ``tool-calls`` or ``null`` (no
@@ -356,6 +469,11 @@ class OpenCodeSessionMonitor:
         # 2. Error: latest assistant message has a notifiable error
         if session.last_message_error in SessionInfo.NOTIFIABLE_ERRORS:
             return SessionState.ERROR
+
+        # A turn that OpenCode marked idle (e.g. interrupted by the user)
+        # is not in flight, so it can't be stalled.
+        if session.is_idle:
+            return SessionState.ACTIVE
 
         # 4. Stalled: assistant was working but time_updated is stale
         if session.updated_ms > 0:
@@ -574,6 +692,42 @@ class OpenCodeSessionMonitor:
             print("\n👋 Monitor stopped")
 
 
+def setup_keychain() -> int:
+    """Prompt for Pushover credentials and store them in the macOS Keychain.
+
+    Secrets are passed to ``security`` on stdin (interactive mode) so they
+    never appear in process arguments visible to ``ps``.
+    """
+    import getpass
+
+    if sys.platform != "darwin":
+        print("Error: --setup-keychain requires macOS.", file=sys.stderr)
+        return 1
+
+    for account, label in (
+        (KEYCHAIN_ACCOUNT_APP_TOKEN, "Pushover app token"),
+        (KEYCHAIN_ACCOUNT_USER_KEY, "Pushover user key"),
+    ):
+        value = getpass.getpass(f"{label}: ").strip()
+        # Pushover tokens/keys are 30 alphanumeric characters.  Rejecting
+        # anything else also keeps the value safe to quote for ``security``.
+        if not re.fullmatch(r"[A-Za-z0-9]{20,64}", value):
+            print(f"Error: {label} doesn't look valid.", file=sys.stderr)
+            return 1
+        cmd = (
+            f'add-generic-password -U -s "{KEYCHAIN_SERVICE}" '
+            f'-a "{account}" -l "{KEYCHAIN_SERVICE} {account}" -w "{value}"\n'
+        )
+        result = subprocess.run(
+            ["security", "-i"], input=cmd, capture_output=True, text=True
+        )
+        if result.returncode != 0 or read_keychain_secret(account) != value:
+            print(f"Error: failed to store {label} in Keychain.", file=sys.stderr)
+            return 1
+        print(f"✓ Stored {label} (service={KEYCHAIN_SERVICE}, account={account})")
+    return 0
+
+
 def main():
     """CLI entry point"""
     import argparse
@@ -583,11 +737,17 @@ def main():
     )
     parser.add_argument(
         "--app-token",
-        required=True,
-        help="Pushover application token (from pushover.net/apps/build)",
+        help="Pushover application token. Prefer the Keychain (see --setup-keychain); "
+        "falls back to $PUSHOVER_APP_TOKEN, then the Keychain.",
     )
     parser.add_argument(
-        "--user-key", required=True, help="Pushover user key (from pushover.net)"
+        "--user-key",
+        help="Pushover user key. Falls back to $PUSHOVER_USER_KEY, then the Keychain.",
+    )
+    parser.add_argument(
+        "--setup-keychain",
+        action="store_true",
+        help="Interactively store Pushover credentials in the macOS Keychain and exit",
     )
     parser.add_argument(
         "--idle-minutes",
@@ -619,9 +779,27 @@ def main():
 
     args = parser.parse_args()
 
+    if args.setup_keychain:
+        sys.exit(setup_keychain())
+
+    app_token, app_src = resolve_credential(
+        args.app_token, "PUSHOVER_APP_TOKEN", KEYCHAIN_ACCOUNT_APP_TOKEN
+    )
+    user_key, user_src = resolve_credential(
+        args.user_key, "PUSHOVER_USER_KEY", KEYCHAIN_ACCOUNT_USER_KEY
+    )
+    if not app_token or not user_key:
+        print("Error: Pushover credentials not found.", file=sys.stderr)
+        print(
+            f"Store them in the Keychain with:\n  {sys.argv[0]} --setup-keychain",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print(f"🔑 Credentials: app token from {app_src}, user key from {user_src}")
+
     monitor = OpenCodeSessionMonitor(
-        pushover_app_token=args.app_token,
-        pushover_user_key=args.user_key,
+        pushover_app_token=app_token,
+        pushover_user_key=user_key,
         idle_threshold_minutes=args.idle_minutes,
         wait_threshold_minutes=args.wait_minutes,
         stall_threshold_minutes=args.stall_minutes,
